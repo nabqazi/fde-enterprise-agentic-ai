@@ -1,24 +1,25 @@
 """Anthropic-backed code reviewer.
 
-Single entry point: `review_code(source)` returns a dict matching the
-`submit_review` tool schema. The function makes exactly one Messages API
-call and forces the model to respond via the tool, so the result is
-already structured JSON — no prose parsing.
+Single entry point: `review_code(source, language)` returns a dict matching
+the `submit_review` tool schema, augmented with `_timing_ms` and `_language`
+metadata keys. The function makes exactly one Messages API call and forces
+the model to respond via the tool, so the result is already structured JSON.
 """
-
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import anthropic
 
 try:
     from dotenv import load_dotenv
-except ImportError:  # pragma: no cover - dotenv is optional at runtime
+except ImportError:
     load_dotenv = None  # type: ignore[assignment]
 
-from prompts import SYSTEM_PROMPT
+from languages import SUPPORTED_LANGUAGES, detect_language
+from prompts import build_system_prompt
 
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
@@ -77,7 +78,7 @@ REVIEW_SCHEMA: dict[str, Any] = {
                     },
                     "code": {
                         "type": "string",
-                        "description": "Self-contained pytest function body.",
+                        "description": "Self-contained test function body.",
                     },
                 },
                 "required": ["name", "targets", "code"],
@@ -130,68 +131,56 @@ _TOOL_DEFINITION: dict[str, Any] = {
 
 
 def looks_like_python(source: str) -> bool:
-    """Loose heuristic: does this look like Python source?
-
-    The check is intentionally permissive — false positives are cheaper
-    than false negatives, since the model itself will push back on
-    obviously-not-Python input. We only reject if there are no Python-ish
-    markers at all.
-    """
-    if not source or not source.strip():
-        return False
-    text = source
-    python_markers = (
-        "def ",
-        "class ",
-        "import ",
-        "from ",
-        "print(",
-        "if __name__",
-        "lambda ",
-        "async def",
-    )
-    return any(marker in text for marker in python_markers)
+    """Backwards-compatible heuristic for Python detection."""
+    lang = detect_language(source)
+    return lang == "python"
 
 
-def review_code(source: str) -> dict[str, Any]:
+def review_code(source: str, language: str = "python") -> dict[str, Any]:
     """Run a single Claude review pass and return the structured result.
 
     Args:
-        source: Python source code to review.
+        source:   Source code to review.
+        language: Language id from SUPPORTED_LANGUAGES (default: python).
 
     Returns:
-        Dict matching the `submit_review` tool schema (design_flaws,
-        proposed_tests, refactor, confidence, caveats).
+        Dict matching the `submit_review` schema plus `_timing_ms` and
+        `_language` metadata keys.
 
     Raises:
         RuntimeError: if the API key is missing or the API call fails.
-            The error message is sanitized — no SDK internals leak.
     """
     if load_dotenv is not None:
         try:
             load_dotenv()
-        except Exception:  # pragma: no cover - defensive
+        except Exception:
             pass
 
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
 
-    client = anthropic.Anthropic(api_key=api_key)
+    lang_info = SUPPORTED_LANGUAGES.get(language, SUPPORTED_LANGUAGES["python"])
+    lang_name = lang_info["name"]
+    test_framework = lang_info["test_framework"]
+    system_prompt = build_system_prompt(language=lang_name, test_framework=test_framework)
 
     user_message = (
-        "Review the following Python code. Respond only via the "
-        "`submit_review` tool.\n\n"
-        "```python\n"
+        f"Review the following {lang_name} code. "
+        "Respond only via the `submit_review` tool.\n\n"
+        f"```{language}\n"
         f"{source}\n"
         "```"
     )
 
+    client = anthropic.Anthropic(api_key=api_key)
+
+    t0 = time.perf_counter()
     try:
         response = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             tools=[_TOOL_DEFINITION],
             tool_choice={"type": "tool", "name": "submit_review"},
             messages=[{"role": "user", "content": user_message}],
@@ -199,14 +188,18 @@ def review_code(source: str) -> dict[str, Any]:
     except Exception as exc:
         print(f"[reviewer] Anthropic API call failed: {exc!r}", flush=True)
         raise RuntimeError(
-            "The review service is unavailable right now. "
+            "The review service is unavailable. "
             "Check your network and API key, then try again."
         ) from None
+    timing_ms = int((time.perf_counter() - t0) * 1000)
 
     for block in response.content:
         if getattr(block, "type", None) == "tool_use" and block.name == "submit_review":
             payload = block.input
             if isinstance(payload, dict):
+                payload["_language"] = language
+                payload["_timing_ms"] = timing_ms
+                payload["_input_chars"] = len(source)
                 return payload
             break
 
@@ -214,6 +207,4 @@ def review_code(source: str) -> dict[str, Any]:
         "[reviewer] Model did not return a submit_review tool_use block.",
         flush=True,
     )
-    raise RuntimeError(
-        "The reviewer returned an unexpected response shape. Try again."
-    )
+    raise RuntimeError("The reviewer returned an unexpected response. Try again.")
